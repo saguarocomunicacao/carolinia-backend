@@ -114,3 +114,142 @@ Sua resposta DEVE ser um único bloco JSON válido, sem nenhum texto fora
 do JSON. Estrutura:
 
 ```json
+{
+  "briefing_summary": "2-4 frases resumindo o que entendi do projeto. Seja específico.",
+  "confidence_level": "high|medium|low",
+  "gaps": [
+    {
+      "category": "audience|problem|success_criteria|constraints|delivery|out_of_scope|other",
+      "title": "Título curto — 4-8 palavras",
+      "question": "Pergunta direta e específica pro cliente responder",
+      "why_matters": "Por que isso bloqueia ou prejudica o trabalho",
+      "priority": "high|medium|low"
+    }
+  ],
+  "notes": "Observações livres pro usuário. Pode ficar vazio."
+}
+```
+
+# Regras finais
+
+- Máximo 10 gaps. Idealmente 5-7.
+- Se o briefing estiver completo, retorna gaps vazio e confidence_level="high".
+- Se faltar TUDO (briefing muito curto), confidence_level="low" e foca 
+  nos 3 gaps mais essenciais.
+- NUNCA invente dados do projeto. Se o material não menciona prazo, 
+  pergunta sobre prazo — não chute uma data.
+- Português brasileiro, tom direto, sem clichê.
+- Trata o cliente por "você".
+- NÃO INCLUA TEXTO FORA DO JSON. Nenhum "Aqui está minha análise:" ou 
+  "Espero ter ajudado". Só o JSON.
+"""
+
+    # Modelos podem ser mais caros pra análise densa
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    
+    # ============================================================
+    # Customização específica do Analista
+    # ============================================================
+    
+    def build_user_message(self, context: AgentContext) -> str:
+        """Monta o input com TODO o contexto disponível (sem truncar duro).
+        
+        Diferente do BaseAgent default que pega top-20 por importância,
+        o Analista quer ver tudo que tem do projeto, ordenado por importância.
+        """
+        parts = []
+        
+        # Contexto básico do projeto
+        parts.append("# Material do projeto")
+        parts.append(f"\n**Nome do projeto:** {context.project_name or 'Sem nome'}")
+        if context.project_stack:
+            parts.append(f"**Stack/contexto técnico:** {context.project_stack}")
+        if context.project_description:
+            parts.append(f"**Descrição inicial:** {context.project_description}")
+        
+        # Entradas de contexto — TODAS, ordenadas por importance
+        if context.context_entries:
+            sorted_entries = sorted(
+                context.context_entries,
+                key=lambda x: x.get("importance", 5),
+                reverse=True,
+            )
+            parts.append(f"\n## Materiais indexados ({len(sorted_entries)} entradas)\n")
+            for entry in sorted_entries:
+                title = entry.get("title", "sem título")
+                imp = entry.get("importance", 5)
+                source = entry.get("source_type", "?")
+                content = entry.get("content", "")
+                # Trunca cada entrada em 5000 chars pra não estourar context window
+                if len(content) > 5000:
+                    content = content[:5000] + "\n[... conteúdo truncado ...]"
+                parts.append(f"\n### {title}")
+                parts.append(f"_Origem: {source} · Importância: {imp}/10_\n")
+                parts.append(f"```\n{content}\n```")
+        else:
+            parts.append("\n_Nenhum material indexado ainda._")
+        
+        # Extra context (info da análise, run anterior, etc)
+        if context.extra_context:
+            parts.append("\n## Contexto da análise")
+            for k, v in context.extra_context.items():
+                parts.append(f"- **{k}**: {v}")
+        
+        return "\n".join(parts)
+    
+    def summarize_output(self, output_text: str) -> str:
+        """Extrai o briefing_summary do JSON como resumo curto."""
+        try:
+            parsed = self.parse_output(output_text)
+            summary = parsed.briefing_summary
+            if len(summary) > 300:
+                summary = summary[:297] + "..."
+            return f"[{len(parsed.gaps)} gaps identificados] {summary}"
+        except Exception:
+            # Fallback se não conseguir parsear
+            return output_text[:300] + ("..." if len(output_text) > 300 else "")
+    
+    @staticmethod
+    def parse_output(output_text: str) -> AnalysisOutput:
+        """Parseia o JSON retornado pelo modelo numa estrutura tipada.
+        
+        Tolera:
+        - JSON dentro de bloco markdown ```json ... ```
+        - Texto antes/depois do JSON
+        - Campos faltantes (preenche com defaults)
+        """
+        # Tenta extrair JSON de dentro de ```json ... ```
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", output_text, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+        else:
+            # Procura o primeiro { até o último }
+            start = output_text.find("{")
+            end = output_text.rfind("}")
+            if start == -1 or end == -1 or end < start:
+                raise ValueError(f"Output não contém JSON parseável: {output_text[:200]}")
+            json_str = output_text[start:end + 1]
+        
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON inválido: {e}. Conteúdo: {json_str[:300]}")
+        
+        gaps_raw = data.get("gaps", [])
+        gaps = []
+        for g in gaps_raw:
+            gaps.append(IdentifiedGap(
+                category=g.get("category", "other"),
+                title=g.get("title", "Sem título"),
+                question=g.get("question", ""),
+                why_matters=g.get("why_matters", ""),
+                priority=g.get("priority", "medium"),
+            ))
+        
+        return AnalysisOutput(
+            briefing_summary=data.get("briefing_summary", ""),
+            gaps=gaps,
+            confidence_level=data.get("confidence_level", "medium"),
+            notes=data.get("notes", ""),
+        )
