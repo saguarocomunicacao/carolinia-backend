@@ -10,18 +10,42 @@ class Settings(BaseSettings):
         extra="ignore",
     )
     
-    # Anthropic
+    # ============================================================
+    # Anthropic (Claude)
+    # ============================================================
     anthropic_api_key: str = ""
     model_orchestrator: str = "claude-opus-4-7"
     model_subagent: str = "claude-sonnet-4-6"
     
+    # ============================================================
+    # OpenAI (GPT, DALL-E)
+    # ============================================================
+    openai_api_key: str = ""
+    model_openai_text: str = "gpt-4o"
+    model_openai_text_fast: str = "gpt-4o-mini"
+    model_openai_image: str = "dall-e-3"
+    
+    # ============================================================
+    # Google (Gemini, Imagen)
+    # ============================================================
+    google_api_key: str = ""
+    model_google_text: str = "gemini-2.0-flash-exp"
+    model_google_text_pro: str = "gemini-1.5-pro"
+    model_google_image: str = "imagen-3.0-generate-001"
+    
+    # ============================================================
     # Lovable Cloud
+    # ============================================================
     lovable_project_url: str = ""
     
-    # Auth interno entre Lovable ↔ Railway
+    # ============================================================
+    # Auth interno Lovable ↔ Railway
+    # ============================================================
     shared_secret: str = ""
     
+    # ============================================================
     # Workspace dos agentes
+    # ============================================================
     workspaces_dir: str = "/workspaces"
 
 
