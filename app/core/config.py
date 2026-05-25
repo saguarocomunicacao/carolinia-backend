@@ -26,12 +26,12 @@ class Settings(BaseSettings):
     model_openai_image: str = "dall-e-3"
     
     # ============================================================
-    # Google (Gemini, Imagen)
+    # Google (Gemini, Nano Banana)
     # ============================================================
     google_api_key: str = ""
-    model_google_text: str = "gemini-2.0-flash-exp"
-    model_google_text_pro: str = "gemini-1.5-pro"
-    model_google_image: str = "imagen-3.0-generate-001"
+    model_google_text: str = "gemini-2.5-flash"
+    model_google_text_pro: str = "gemini-2.5-pro"
+    model_google_image: str = "gemini-2.5-flash-image"
     
     # ============================================================
     # Lovable Cloud
