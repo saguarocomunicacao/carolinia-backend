@@ -11,6 +11,12 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.services.git_service import clone_repo, list_files
+from app.services.llm_router import (
+    ModelChoice,
+    Provider,
+    call_llm,
+    generate_image,
+)
 from app.services.lovable_client import lovable_client
 from app.services.text_extractor import estimate_tokens, extract_text
 
@@ -29,6 +35,8 @@ class HealthResponse(BaseModel):
     has_anthropic_key: bool
     has_shared_secret: bool
     has_lovable_url: bool
+    has_openai_key: bool
+    has_google_key: bool
 
 
 class ProcessDemandRequest(BaseModel):
@@ -72,6 +80,26 @@ class ProcessFileResponse(BaseModel):
     file_id: str
 
 
+class RouterTestRequest(BaseModel):
+    prompt: str = "Diga 'olá' em português, espanhol e inglês, separados por vírgula."
+
+
+class ProviderTestResult(BaseModel):
+    provider: str
+    model: str
+    success: bool
+    text: str = ""
+    error: str = ""
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+
+
+class RouterTestResponse(BaseModel):
+    results: list[ProviderTestResult]
+
+
 # ============================================================
 # Auth helper
 # ============================================================
@@ -95,11 +123,63 @@ async def health() -> HealthResponse:
         has_anthropic_key=bool(settings.anthropic_api_key),
         has_shared_secret=bool(settings.shared_secret),
         has_lovable_url=bool(settings.lovable_project_url),
+        has_openai_key=bool(settings.openai_api_key),
+        has_google_key=bool(settings.google_api_key),
     )
 
 
 # ============================================================
-# /process-demand (esqueleto — agente IA virá no P07)
+# /router-test — valida cada um dos 3 providers
+# ============================================================
+
+@router.post("/router-test", response_model=RouterTestResponse)
+async def router_test_endpoint(
+    payload: RouterTestRequest,
+    x_shared_secret: str | None = Header(default=None, alias="X-Shared-Secret"),
+) -> RouterTestResponse:
+    """Testa os 3 providers individualmente. Não usa fallback — testa cada um."""
+    _verify_secret(x_shared_secret)
+    
+    test_cases = [
+        (Provider.ANTHROPIC, settings.model_orchestrator),
+        (Provider.OPENAI, settings.model_openai_text),
+        (Provider.GOOGLE, settings.model_google_text),
+    ]
+    
+    results = []
+    
+    for provider, model in test_cases:
+        try:
+            response = call_llm(
+                system_prompt="Você é um assistente conciso. Responda em uma linha.",
+                user_message=payload.prompt,
+                model_preferences=[ModelChoice(provider, model)],  # SÓ esse, sem fallback
+                max_tokens=200,
+                temperature=0.7,
+            )
+            results.append(ProviderTestResult(
+                provider=provider.value,
+                model=model,
+                success=True,
+                text=response.text[:300],  # Limita pra resposta não ficar gigante
+                tokens_input=response.tokens_input,
+                tokens_output=response.tokens_output,
+                cost_usd=round(response.cost_usd, 6),
+                latency_ms=response.latency_ms,
+            ))
+        except Exception as e:
+            results.append(ProviderTestResult(
+                provider=provider.value,
+                model=model,
+                success=False,
+                error=str(e)[:500],
+            ))
+    
+    return RouterTestResponse(results=results)
+
+
+# ============================================================
+# /process-demand (esqueleto — agente IA vem nos próximos passos)
 # ============================================================
 
 @router.post("/process-demand", response_model=ProcessDemandResponse)
@@ -146,10 +226,8 @@ async def _clone_and_index(
     access_token_secret_id: str,
     default_branch: str,
 ):
-    """Background task: busca token, clona, indexa arquivos relevantes."""
     print(f"[clone-repo] Iniciando clone: {repo_full_name}")
     
-    # 1. Busca o PAT no vault via Edge Function
     access_token = await lovable_client.get_project_secret(access_token_secret_id)
     if not access_token:
         await lovable_client.send_repo_status(
@@ -159,7 +237,6 @@ async def _clone_and_index(
         )
         return
     
-    # 2. Clona o repo
     success, error, path = clone_repo(
         project_id=project_id,
         repo_full_name=repo_full_name,
@@ -179,7 +256,6 @@ async def _clone_and_index(
     
     print(f"[clone-repo] Clone OK: {repo_full_name}. Indexando...")
     
-    # 3. Indexa arquivos relevantes em project_context
     files = list_files(path)
     context_entries = []
     
@@ -206,7 +282,6 @@ async def _clone_and_index(
 
 
 def _calculate_importance(relative_path: PathLib) -> int:
-    """Importância 1-10 baseada no nome do arquivo."""
     name = relative_path.name.lower()
     if name in ("readme.md", "readme"):
         return 10
@@ -250,7 +325,6 @@ async def _download_and_index_file(
     mime_type: str | None,
     category: str,
 ):
-    """Background task: baixa arquivo, extrai texto, insere em project_context."""
     print(f"[process-file] Baixando: {file_name}")
     
     try:
@@ -259,7 +333,6 @@ async def _download_and_index_file(
             response.raise_for_status()
             content = response.content
         
-        # Salva em temp pra processar com pypdf/Pillow/Tesseract
         with tempfile.NamedTemporaryFile(
             suffix=PathLib(file_name).suffix,
             delete=False,
