@@ -5,11 +5,12 @@ O Router tenta cada um até conseguir uma resposta.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
 from app.core.config import settings
 
@@ -43,14 +44,14 @@ class LLMResponse:
     tokens_output: int = 0
     cost_usd: float = 0.0
     latency_ms: int = 0
-    raw: Any = None  # Resposta crua do SDK, pra debug
+    raw: Any = None
 
 
 @dataclass
 class ImageResponse:
     """Resposta padronizada de geração de imagem."""
-    image_url: str | None = None  # URL se for hosted (OpenAI)
-    image_b64: str | None = None  # Base64 se for inline (Google)
+    image_url: str | None = None
+    image_b64: str | None = None
     provider: Provider = Provider.OPENAI
     model: str = ""
     cost_usd: float = 0.0
@@ -59,7 +60,30 @@ class ImageResponse:
 
 
 # ============================================================
-# Pricing (em USD por 1M tokens, snapshot atual — ajustar quando precisar)
+# Modelos que rejeitam temperature/top_p/top_k (Anthropic Opus 4.7+)
+# ============================================================
+# Ref: https://docs.anthropic.com/en/release-notes/api
+# A partir de Claude Opus 4.7, sampling params são deprecados.
+
+MODELS_REJECT_SAMPLING_PARAMS = {
+    "claude-opus-4-7",
+    "claude-opus-4-7-20250101",  # variações com data
+    # Adicionar futuros Sonnet 4.7+ / Haiku 4.7+ aqui quando surgirem
+}
+
+
+def _model_rejects_sampling(model: str) -> bool:
+    """True se o modelo rejeita temperature/top_p/top_k."""
+    if model in MODELS_REJECT_SAMPLING_PARAMS:
+        return True
+    # Cobertura genérica pra variantes com data ou sufixo
+    if model.startswith("claude-opus-4-7"):
+        return True
+    return False
+
+
+# ============================================================
+# Pricing (em USD por 1M tokens — snapshot, ajustar quando mudar)
 # ============================================================
 
 PRICING = {
@@ -71,16 +95,16 @@ PRICING = {
     # OpenAI
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    # Google (Gemini)
-    "gemini-2.0-flash-exp": {"input": 0.0, "output": 0.0},  # Preview, grátis no AI Studio
-    "gemini-1.5-pro": {"input": 1.25, "output": 5.0},
-    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    # Google (Gemini 2.5)
+    "gemini-2.5-flash": {"input": 0.075, "output": 0.30},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.0},
+    "gemini-2.5-flash-image": {"input": 0.30, "output": 30.0},  # imagem cobra alto no output
 }
 
-# Pricing pra imagens (preço por imagem, não por token)
+# Imagens (preço por imagem)
 IMAGE_PRICING = {
-    "dall-e-3": 0.040,           # 1024x1024 standard
-    "imagen-3.0-generate-001": 0.040,
+    "dall-e-3": 0.040,
+    "gemini-2.5-flash-image": 0.039,  # Nano Banana ~$0.039/imagem 1024x1024
 }
 
 
@@ -92,7 +116,7 @@ def _calculate_cost(model: str, tokens_in: int, tokens_out: int) -> float:
 
 
 # ============================================================
-# Clients lazy (só inicializa quando precisar)
+# Clients lazy
 # ============================================================
 
 _anthropic_client = None
@@ -146,13 +170,17 @@ def _call_anthropic(
     client = _get_anthropic()
     start = time.time()
     
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    # Pra Opus 4.7+, temperature/top_p/top_k são proibidos
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if not _model_rejects_sampling(model):
+        kwargs["temperature"] = temperature
+    
+    response = client.messages.create(**kwargs)
     
     latency = int((time.time() - start) * 1000)
     text = response.content[0].text if response.content else ""
@@ -218,7 +246,6 @@ def _call_google(
     genai = _get_google()
     start = time.time()
     
-    # Gemini junta system + user numa única instrução
     gemini_model = genai.GenerativeModel(
         model_name=model,
         system_instruction=system_prompt,
@@ -233,7 +260,6 @@ def _call_google(
     latency = int((time.time() - start) * 1000)
     text = response.text if hasattr(response, "text") else ""
     
-    # Gemini usage_metadata tem prompt_token_count e candidates_token_count
     usage = getattr(response, "usage_metadata", None)
     tokens_in = getattr(usage, "prompt_token_count", 0) if usage else 0
     tokens_out = getattr(usage, "candidates_token_count", 0) if usage else 0
@@ -280,19 +306,35 @@ def _generate_image_openai(prompt: str, size: str = "1024x1024") -> ImageRespons
 
 
 def _generate_image_google(prompt: str, size: str = "1024x1024") -> ImageResponse:
-    """Gera imagem com Imagen 3. Requer projeto Google Cloud com billing."""
+    """Gera imagem com Nano Banana (gemini-2.5-flash-image).
+    
+    Diferente do Imagen antigo, Nano Banana usa a API normal do Gemini
+    e retorna a imagem como parte inline_data nos parts da resposta.
+    """
     genai = _get_google()
     start = time.time()
     
-    # Imagen API é diferente do Gemini — usa generate_images
-    # Nota: pode falhar se billing do Google Cloud não estiver ativo
-    model = genai.ImageGenerationModel(settings.model_google_image)
-    response = model.generate_images(prompt=prompt, number_of_images=1)
+    gemini_model = genai.GenerativeModel(
+        model_name=settings.model_google_image,
+    )
+    response = gemini_model.generate_content(prompt)
     
     latency = int((time.time() - start) * 1000)
     image_b64 = None
-    if response and response.images:
-        image_b64 = response.images[0]._image_bytes  # bytes raw
+    
+    # Procura por inline_data nos parts da resposta
+    try:
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                inline = getattr(part, "inline_data", None)
+                if inline and inline.data:
+                    # inline.data já vem como bytes
+                    image_b64 = base64.b64encode(inline.data).decode("utf-8")
+                    break
+            if image_b64:
+                break
+    except (AttributeError, IndexError) as e:
+        logger.warning("Não foi possível extrair imagem do Nano Banana: %s", e)
     
     return ImageResponse(
         image_b64=image_b64,
@@ -376,7 +418,7 @@ def generate_image(
 ) -> ImageResponse:
     """Gera imagem usando o primeiro provider disponível.
     
-    Default: tenta Google (Imagen 3) primeiro, fallback OpenAI (DALL-E 3).
+    Default: tenta Google (Nano Banana) primeiro, fallback OpenAI (DALL-E 3).
     """
     if provider_preferences is None:
         provider_preferences = [Provider.GOOGLE, Provider.OPENAI]
@@ -415,7 +457,7 @@ def generate_image(
 PRESET_ANALISE_DENSA = [
     ModelChoice(Provider.ANTHROPIC, settings.model_orchestrator),  # claude-opus-4-7
     ModelChoice(Provider.OPENAI, settings.model_openai_text),       # gpt-4o
-    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),   # gemini-1.5-pro
+    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),   # gemini-2.5-pro
 ]
 
 # Decisão de orquestração (raciocínio estruturado)
@@ -424,22 +466,22 @@ PRESET_ORQUESTRACAO = [
     ModelChoice(Provider.OPENAI, settings.model_openai_text),
 ]
 
-# Tarefas rápidas, código simples (Junior Dev)
+# Tarefas rápidas (Junior Dev)
 PRESET_RAPIDO = [
     ModelChoice(Provider.ANTHROPIC, settings.model_subagent),       # claude-sonnet-4-6
     ModelChoice(Provider.OPENAI, settings.model_openai_text_fast),  # gpt-4o-mini
-    ModelChoice(Provider.GOOGLE, settings.model_google_text),       # gemini-2.0-flash-exp
+    ModelChoice(Provider.GOOGLE, settings.model_google_text),       # gemini-2.5-flash
 ]
 
-# Copywriting / texto criativo (OpenAI tem reputação aqui)
+# Copywriting / texto criativo
 PRESET_COPY = [
     ModelChoice(Provider.OPENAI, settings.model_openai_text),
     ModelChoice(Provider.ANTHROPIC, settings.model_orchestrator),
 ]
 
-# Análise visual (entender imagem que o usuário mandou)
+# Análise visual (entender imagem)
 PRESET_VISUAL = [
-    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),   # Gemini é forte em visão
+    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),
     ModelChoice(Provider.ANTHROPIC, settings.model_orchestrator),
     ModelChoice(Provider.OPENAI, settings.model_openai_text),
 ]
