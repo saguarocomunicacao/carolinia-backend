@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     # Workspace dos agentes
     # ============================================================
     workspaces_dir: str = "/workspaces"
+    
+    # ============================================================
+    # Orquestrador (P07.5.d)
+    # ============================================================
+    # Quantas demandas executar em paralelo por projeto (max)
+    max_parallel_demands_per_project: int = 3
+    
+    # Intervalo do polling do worker em segundos
+    worker_poll_interval_seconds: int = 30
+    
+    # Duração da simulação de execução de demand (P07.5.d temporário)
+    simulated_execution_seconds: int = 10
 
 
 settings = Settings()
