@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.agents.analista_briefing import AnalistaBriefing
 from app.agents.base import AgentContext
+from app.agents.planejador import Planejador
 from app.core.config import settings
 from app.services.context_loader import fetch_project_context
 from app.services.git_service import clone_repo, list_files
@@ -115,6 +116,18 @@ class AnalyzeBriefingResponse(BaseModel):
     accepted: bool = True
     analysis_run_id: str
     message: str = "Análise iniciada em background"
+
+
+class PlanRoadmapRequest(BaseModel):
+    project_id: str
+    analysis_run_id: str
+    source: str = "manual"
+
+
+class PlanRoadmapResponse(BaseModel):
+    accepted: bool = True
+    analysis_run_id: str
+    message: str = "Planejador iniciado em background"
 
 
 # ============================================================
@@ -686,3 +699,259 @@ async def _finalize_failed(
             )
     except Exception:
         logger.exception("Falha em finalize-analysis-run (failed) pra run=%s", analysis_run_id)
+
+
+# ============================================================
+# /plan-roadmap — endpoint do Planejador
+# ============================================================
+
+@router.post("/plan-roadmap", response_model=PlanRoadmapResponse)
+async def plan_roadmap_endpoint(
+    payload: PlanRoadmapRequest,
+    background_tasks: BackgroundTasks,
+    x_shared_secret: str | None = Header(default=None, alias="X-Shared-Secret"),
+) -> PlanRoadmapResponse:
+    """Recebe pedido de planejamento, responde 200 imediato, processa em background."""
+    _verify_secret(x_shared_secret)
+    
+    logger.info(
+        "[plan-roadmap] Recebido: project=%s run=%s source=%s",
+        payload.project_id, payload.analysis_run_id, payload.source,
+    )
+    
+    background_tasks.add_task(
+        _plan_roadmap_task,
+        project_id=payload.project_id,
+        analysis_run_id=payload.analysis_run_id,
+        source=payload.source,
+    )
+    
+    return PlanRoadmapResponse(
+        accepted=True,
+        analysis_run_id=payload.analysis_run_id,
+    )
+
+
+async def _plan_roadmap_task(
+    project_id: str,
+    analysis_run_id: str,
+    source: str,
+) -> None:
+    """Task assíncrona — busca contexto + clarificações, roda Planejador, persiste roadmap."""
+    marker = f"[planejador project={project_id} run={analysis_run_id}]"
+    logger.info("%s Iniciando", marker)
+    
+    # 1. Busca contexto do projeto
+    ctx_data = await fetch_project_context(project_id, min_importance=1)
+    if not ctx_data.get("ok"):
+        logger.error("%s Falha buscando project_context", marker)
+        await _finalize_planning_failed(analysis_run_id, project_id, "Falha buscando project_context")
+        return
+    
+    context_entries = ctx_data.get("entries", [])
+    if not context_entries:
+        logger.warning("%s Sem context_entries — planejamento pode ficar pobre", marker)
+    
+    # 2. Busca clarificações respondidas (do Analista)
+    clarifications = await _fetch_consolidated_briefing(project_id)
+    logger.info("%s Recebidas %d clarificações respondidas", marker, len(clarifications))
+    
+    # 3. Busca meta do projeto
+    project_meta = await _fetch_project_meta(project_id)
+    
+    # 4. Monta AgentContext
+    agent_context = AgentContext(
+        project_id=project_id,
+        project_name=project_meta.get("name", ""),
+        project_stack=project_meta.get("stack", ""),
+        project_description=project_meta.get("description", ""),
+        context_entries=context_entries,
+        extra_context={
+            "analysis_run_id": analysis_run_id,
+            "source": source,
+            "clarifications": clarifications,
+            "total_clarifications": len(clarifications),
+            "total_context_entries": len(context_entries),
+        },
+    )
+    
+    # 5. Instrução do Planejador
+    instruction = (
+        "Analise o briefing consolidado (contexto do projeto + clarificações respondidas) "
+        "e produza um roadmap estruturado em fases. Cada fase deve agrupar demandas "
+        "concretas com critérios de aceite, complexidade estimada e dependências entre si. "
+        "Siga ESTRITAMENTE o formato JSON descrito no seu system prompt."
+    )
+    
+    # 6. Roda o Planejador
+    try:
+        planejador = Planejador()
+        result = await planejador.run(context=agent_context, instruction=instruction)
+    except Exception as e:
+        logger.exception("%s Erro rodando Planejador", marker)
+        await _finalize_planning_failed(
+            analysis_run_id, project_id,
+            f"Erro rodando Planejador: {str(e)[:500]}",
+        )
+        return
+    
+    if not result.success:
+        logger.error("%s Planejador success=False: %s", marker, result.error)
+        await _finalize_planning_failed(
+            analysis_run_id, project_id,
+            f"Planejador falhou: {result.error}",
+        )
+        return
+    
+    logger.info(
+        "%s Planejador completou: model=%s cost=$%.4f tokens_in=%d tokens_out=%d",
+        marker, result.model, result.cost_usd, result.tokens_input, result.tokens_output,
+    )
+    
+    # 7. Parseia output
+    try:
+        roadmap_output = Planejador.parse_output(result.output_text)
+    except Exception as e:
+        logger.exception("%s Falha parseando JSON do Planejador", marker)
+        logger.error("%s Output bruto: %s", marker, result.output_text[:500])
+        await _finalize_planning_failed(
+            analysis_run_id, project_id,
+            f"Output do Planejador não é JSON válido: {str(e)[:300]}",
+        )
+        return
+    
+    if not roadmap_output.phases:
+        logger.error("%s Planejador retornou 0 fases — roadmap vazio", marker)
+        await _finalize_planning_failed(
+            analysis_run_id, project_id,
+            "Planejador retornou roadmap vazio (0 fases)",
+        )
+        return
+    
+    total_demands = sum(len(p.demands) for p in roadmap_output.phases)
+    logger.info(
+        "%s Parseou: %d fases, %d demandas total",
+        marker, len(roadmap_output.phases), total_demands,
+    )
+    
+    # 8. Persiste no banco via Edge Function persist-roadmap
+    persist_payload = {
+        "project_id": project_id,
+        "analysis_run_id": analysis_run_id,
+        "roadmap_summary": roadmap_output.roadmap_summary,
+        "phases": [
+            {
+                "title": p.title,
+                "description": p.description,
+                "rationale": p.rationale,
+                "order": p.order,
+                "demands": [
+                    {
+                        "title": d.title,
+                        "description": d.description,
+                        "acceptance_criteria": d.acceptance_criteria,
+                        "complexity": d.complexity,
+                        "order": d.order,
+                        "depends_on_titles": d.depends_on_titles,
+                    }
+                    for d in p.demands
+                ],
+            }
+            for p in roadmap_output.phases
+        ],
+        "out_of_scope": roadmap_output.out_of_scope,
+        "risks": roadmap_output.risks,
+        "total_cost_usd": result.cost_usd,
+        "total_tokens": result.tokens_input + result.tokens_output,
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            persist_resp = await client.post(
+                f"{settings.lovable_project_url}/functions/v1/persist-roadmap",
+                headers={
+                    "X-Shared-Secret": settings.shared_secret,
+                    "Content-Type": "application/json",
+                },
+                json=persist_payload,
+            )
+            if persist_resp.status_code != 200:
+                logger.error(
+                    "%s persist-roadmap retornou %d: %s",
+                    marker, persist_resp.status_code, persist_resp.text[:300],
+                )
+                await _finalize_planning_failed(
+                    analysis_run_id, project_id,
+                    f"persist-roadmap falhou: {persist_resp.status_code} {persist_resp.text[:200]}",
+                )
+                return
+            persist_data = persist_resp.json()
+    except Exception as e:
+        logger.exception("%s Exceção chamando persist-roadmap", marker)
+        await _finalize_planning_failed(
+            analysis_run_id, project_id,
+            f"Erro chamando persist-roadmap: {str(e)[:300]}",
+        )
+        return
+    
+    logger.info(
+        "%s Roadmap persistido: %d phases, %d demands, %d dependências resolvidas, %d não-resolvidas",
+        marker,
+        persist_data.get("phases_created", 0),
+        persist_data.get("demands_created", 0),
+        persist_data.get("dependencies_resolved", 0),
+        len(persist_data.get("unresolved_dependencies", [])),
+    )
+    
+    logger.info("%s Concluído com sucesso", marker)
+
+
+async def _fetch_consolidated_briefing(project_id: str) -> list[dict[str, Any]]:
+    """Busca clarificações respondidas via Edge Function get-consolidated-briefing."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            response = await client.post(
+                f"{settings.lovable_project_url}/functions/v1/get-consolidated-briefing",
+                headers={
+                    "X-Shared-Secret": settings.shared_secret,
+                    "Content-Type": "application/json",
+                },
+                json={"project_id": project_id},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("clarifications", [])
+            logger.warning("get-consolidated-briefing retornou %d", response.status_code)
+    except Exception:
+        logger.exception("Falha buscando clarificações do projeto %s", project_id)
+    return []
+
+
+async def _finalize_planning_failed(
+    analysis_run_id: str,
+    project_id: str,
+    error_message: str,
+) -> None:
+    """Marca analysis_run como failed em caso de falha do Planejador.
+    
+    Nota: NÃO reverte projects.roadmap_status de 'planning' pra 'not_started'.
+    Se UI ficar travada, rodar manualmente no Lovable:
+      UPDATE projects SET roadmap_status='not_started' WHERE id='X';
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            await client.post(
+                f"{settings.lovable_project_url}/functions/v1/finalize-analysis-run",
+                headers={
+                    "X-Shared-Secret": settings.shared_secret,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "analysis_run_id": analysis_run_id,
+                    "project_id": project_id,
+                    "status": "failed",
+                    "error_message": error_message,
+                },
+            )
+    except Exception:
+        logger.exception("Falha em finalize (planning failed) pra run=%s", analysis_run_id)
