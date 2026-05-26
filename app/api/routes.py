@@ -955,3 +955,166 @@ async def _finalize_planning_failed(
             )
     except Exception:
         logger.exception("Falha em finalize (planning failed) pra run=%s", analysis_run_id)
+
+# ============================================================
+# /debug/workspace — endpoint temporário pra validar workspace_manager
+# REMOVER após P07.5.b validado
+# ============================================================
+
+from app.services.workspace_manager import (
+    ensure_workspace_ready,
+    create_worktree,
+    delete_worktree,
+    list_worktrees,
+    workspace_health_check,
+    get_worktree_path,
+    get_branch_name,
+)
+
+
+class WorkspaceDebugRequest(BaseModel):
+    operation: str  # 'ensure_ready' | 'create_worktree' | 'delete_worktree' | 'list' | 'health' | 'full_test'
+    project_id: str
+    repo_id: str
+    demand_id: str | None = None
+    repo_full_name: str | None = None
+    github_token: str | None = None
+    default_branch: str = "main"
+
+
+@router.post("/debug/workspace")
+async def workspace_debug_endpoint(
+    payload: WorkspaceDebugRequest,
+    x_shared_secret: str | None = Header(default=None, alias="X-Shared-Secret"),
+) -> dict:
+    """ENDPOINT TEMPORÁRIO — valida workspace_manager. REMOVER após P07.5.b."""
+    _verify_secret(x_shared_secret)
+    
+    op = payload.operation
+    
+    if op == "ensure_ready":
+        if not payload.repo_full_name or not payload.github_token:
+            raise HTTPException(400, "ensure_ready requer repo_full_name e github_token")
+        success, error, paths = await ensure_workspace_ready(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            repo_full_name=payload.repo_full_name,
+            github_token=payload.github_token,
+            default_branch=payload.default_branch,
+        )
+        return {
+            "operation": op,
+            "success": success,
+            "error": error,
+            "paths": {
+                "root": str(paths.root),
+                "main_clone": str(paths.main_clone),
+                "worktrees_dir": str(paths.worktrees_dir),
+            },
+        }
+    
+    elif op == "create_worktree":
+        if not payload.demand_id:
+            raise HTTPException(400, "create_worktree requer demand_id")
+        success, error, info = await create_worktree(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            demand_id=payload.demand_id,
+            default_branch=payload.default_branch,
+        )
+        return {
+            "operation": op,
+            "success": success,
+            "error": error,
+            "worktree": {
+                "demand_id": info.demand_id,
+                "path": str(info.path),
+                "branch_name": info.branch_name,
+            } if info else None,
+        }
+    
+    elif op == "delete_worktree":
+        if not payload.demand_id:
+            raise HTTPException(400, "delete_worktree requer demand_id")
+        success, error = await delete_worktree(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            demand_id=payload.demand_id,
+            force=True,
+        )
+        return {"operation": op, "success": success, "error": error}
+    
+    elif op == "list":
+        worktrees = await list_worktrees(payload.project_id, payload.repo_id)
+        return {"operation": op, "worktrees": worktrees, "count": len(worktrees)}
+    
+    elif op == "health":
+        health = await workspace_health_check(payload.project_id, payload.repo_id)
+        return {"operation": op, "health": health}
+    
+    elif op == "full_test":
+        if not payload.repo_full_name or not payload.github_token:
+            raise HTTPException(400, "full_test requer repo_full_name e github_token")
+        if not payload.demand_id:
+            raise HTTPException(400, "full_test requer demand_id (será criada worktree de teste)")
+        
+        results = {}
+        
+        # 1. ensure_ready
+        success, error, paths = await ensure_workspace_ready(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            repo_full_name=payload.repo_full_name,
+            github_token=payload.github_token,
+            default_branch=payload.default_branch,
+        )
+        results["1_ensure_ready"] = {
+            "success": success, "error": error,
+            "main_clone": str(paths.main_clone),
+        }
+        if not success:
+            return {"operation": op, "results": results, "stopped_at_step": 1}
+        
+        # 2. create_worktree
+        success, error, info = await create_worktree(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            demand_id=payload.demand_id,
+            default_branch=payload.default_branch,
+        )
+        results["2_create_worktree"] = {
+            "success": success, "error": error,
+            "worktree_path": str(info.path) if info else None,
+            "branch_name": info.branch_name if info else None,
+        }
+        if not success:
+            return {"operation": op, "results": results, "stopped_at_step": 2}
+        
+        # 3. health check
+        health = await workspace_health_check(payload.project_id, payload.repo_id)
+        results["3_health"] = health
+        
+        # 4. list worktrees
+        worktrees = await list_worktrees(payload.project_id, payload.repo_id)
+        results["4_list_worktrees"] = {"count": len(worktrees), "worktrees": worktrees}
+        
+        # 5. delete worktree
+        success, error = await delete_worktree(
+            project_id=payload.project_id,
+            repo_id=payload.repo_id,
+            demand_id=payload.demand_id,
+            force=True,
+        )
+        results["5_delete_worktree"] = {"success": success, "error": error}
+        
+        # 6. health check final
+        health_after = await workspace_health_check(payload.project_id, payload.repo_id)
+        results["6_health_after"] = health_after
+        
+        return {"operation": op, "results": results}
+    
+    else:
+        raise HTTPException(
+            400,
+            f"Operação inválida: {op}. Aceitos: ensure_ready, create_worktree, delete_worktree, list, health, full_test",
+        )
