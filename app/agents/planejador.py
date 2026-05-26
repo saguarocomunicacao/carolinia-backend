@@ -42,7 +42,7 @@ class PlannedDemand:
     acceptance_criteria: str
     complexity: str          # 'S' | 'M' | 'L' | 'XL'
     order: int               # Ordem dentro da fase
-    depends_on_titles: list[str] = field(default_factory=list)  # Títulos das demandas que precisam estar prontas antes
+    depends_on_titles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -58,11 +58,11 @@ class PlannedPhase:
 @dataclass
 class RoadmapOutput:
     """Estrutura completa do output do Planejador."""
-    roadmap_summary: str     # 3-5 frases resumindo a estratégia geral do roadmap
+    roadmap_summary: str
     phases: list[PlannedPhase]
-    out_of_scope: list[str]  # O que o Planejador entendeu que NÃO faz parte
-    risks: list[str]         # Riscos identificados (técnicos ou de negócio)
-    notes: str               # Observações livres pro usuário
+    out_of_scope: list[str]
+    risks: list[str]
+    notes: str
 
 
 # ============================================================
@@ -199,15 +199,28 @@ fora do JSON. Estrutura:
 
 - Máximo de 12 fases por roadmap. Idealmente 3-7.
 - Máximo de 15 demandas por fase. Idealmente 5-10.
-- Total geral: máximo 100 demandas. Se passar disso, quebre em fases 
-  posteriores que podem ser detalhadas DEPOIS de uma primeira aprovação 
-  (deixe rationale claro).
+- Total geral: máximo 50 demandas. Mais que isso ESGOTA SEU LIMITE DE TOKENS 
+  e o JSON é truncado — fica inválido e perde tudo. Se o projeto é gigantesco, 
+  proponha PRIMEIRA ITERAÇÃO do roadmap (Fundações + Core) e indica em 
+  out_of_scope que "Polish, integrações secundárias e features avançadas 
+  serão planejadas em iteração futura após validação do MVP".
+
+- BUDGET DE TOKENS: cada demand consome ~300-400 tokens (title + description 
+  + acceptance_criteria). Com max_tokens=16k disponível pro JSON, você tem 
+  margem confortável pra ~40 demands BEM DESCRITAS ou ~60 demands COMPACTAS. 
+  Sempre PRIORIZE QUALIDADE sobre quantidade.
+
+- FINALIZE O JSON SEMPRE. Se você sentir que está chegando perto do limite, 
+  REDUZA o detalhamento das próximas demands em vez de truncar. Um JSON 
+  completo com 25 demands é INFINITAMENTE melhor que um JSON truncado com 
+  40 demands.
+
 - Português brasileiro, tom direto, sem clichê.
 - Trata o cliente por "você".
 - NÃO INCLUA TEXTO FORA DO JSON.
 """
 
-    max_tokens: int = 8192  # Roadmap pode ser bem maior que análise de briefing
+    max_tokens: int = 16384  # Roadmap denso pode passar de 8k; Opus 4.7 aceita até 32k
     temperature: float = 0.7
     
     # ============================================================
