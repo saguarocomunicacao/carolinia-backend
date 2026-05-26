@@ -24,33 +24,29 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Worker em background — polling 30s
+# Worker em background — polling configurável
 # ============================================================
 
-WORKER_POLL_INTERVAL_SECONDS = 30
 _worker_task: asyncio.Task | None = None
 _worker_stop_event: asyncio.Event | None = None
 
 
 async def _orchestration_worker() -> None:
-    """Loop infinito que orquestra projetos ativos a cada 30s.
-    
-    Como funciona:
-    1. Lista projetos ativos (execution_status=running, roadmap approved/executing)
-    2. Pra cada projeto, chama orchestrate_project()
-    3. Aguarda 30s
-    4. Repete
-    
-    Termina quando _worker_stop_event é setado (shutdown do FastAPI).
-    """
-    logger.info("[worker] Iniciando loop de orquestração (poll=%ds)", WORKER_POLL_INTERVAL_SECONDS)
+    """Loop infinito que orquestra projetos ativos a cada N segundos."""
+    poll_interval = settings.worker_poll_interval_seconds
+    logger.info(
+        "[worker] Iniciando loop de orquestração (poll=%ds, max_parallel=%d, sim_seconds=%d)",
+        poll_interval,
+        settings.max_parallel_demands_per_project,
+        settings.simulated_execution_seconds,
+    )
     
     while _worker_stop_event and not _worker_stop_event.is_set():
         try:
             project_ids = await list_active_projects()
             
             if not project_ids:
-                logger.debug("[worker] Nenhum projeto ativo no momento")
+                logger.info("[worker] Nenhum projeto ativo. Aguardando %ds.", poll_interval)
             else:
                 logger.info("[worker] Orquestrando %d projetos ativos", len(project_ids))
                 
@@ -69,22 +65,18 @@ async def _orchestration_worker() -> None:
                             )
                     except Exception:
                         logger.exception("[worker] Erro orquestrando project=%s", project_id)
-                        # Continua pros outros projetos
                         continue
         
         except Exception:
             logger.exception("[worker] Erro no loop principal — segue")
         
-        # Espera 30s OU stop event (o que vier primeiro)
         try:
             await asyncio.wait_for(
                 _worker_stop_event.wait(),
-                timeout=WORKER_POLL_INTERVAL_SECONDS,
+                timeout=poll_interval,
             )
-            # Se chegou aqui sem timeout, o stop event foi setado
             break
         except asyncio.TimeoutError:
-            # Normal — timeout significa "passaram 30s, vamos repetir"
             continue
     
     logger.info("[worker] Loop encerrado")
@@ -96,12 +88,16 @@ async def _orchestration_worker() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle do FastAPI: startup e shutdown."""
+    """Lifecycle do FastAPI."""
     global _worker_task, _worker_stop_event
     
     print(f"CarolinIA backend iniciando. Workspaces: {settings.workspaces_dir}")
+    print(
+        f"Worker config: poll={settings.worker_poll_interval_seconds}s, "
+        f"max_parallel={settings.max_parallel_demands_per_project}, "
+        f"sim_seconds={settings.simulated_execution_seconds}"
+    )
     
-    # 1. Recovery: reverte demands órfãs (in_progress → pending)
     try:
         recovered = await recover_orphaned_demands()
         if recovered > 0:
@@ -114,14 +110,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("[startup] Erro em recovery — seguindo")
     
-    # 2. Inicia worker em background
     _worker_stop_event = asyncio.Event()
     _worker_task = asyncio.create_task(_orchestration_worker())
     logger.info("[startup] Worker em background iniciado")
     
     yield
     
-    # Shutdown
     print("CarolinIA backend encerrando.")
     if _worker_stop_event:
         _worker_stop_event.set()
@@ -153,10 +147,6 @@ app = FastAPI(
 app.include_router(router)
 
 
-# ============================================================
-# Endpoint raiz
-# ============================================================
-
 @app.get("/")
 async def root():
     return {"service": "carolinia-backend", "status": "ok", "version": "0.2.0"}
@@ -168,7 +158,7 @@ async def root():
 
 class WebhookOrchestrateRequest(BaseModel):
     project_id: str
-    trigger_source: str = "webhook"  # 'webhook' | 'phase_approved' | 'demand_completed' | 'manual'
+    trigger_source: str = "webhook"
 
 
 @app.post("/webhook/orchestrate")
@@ -176,14 +166,7 @@ async def webhook_orchestrate(
     payload: WebhookOrchestrateRequest,
     x_shared_secret: str | None = Header(default=None, alias="X-Shared-Secret"),
 ):
-    """Webhook chamado por trigger SQL do Supabase quando:
-    - Phase é aprovada
-    - Demand completa (libera dependentes)
-    - User aciona manualmente
-    
-    Em vez de esperar o polling de 30s, dispara orquestração imediatamente.
-    Fire-and-forget: responde 200 logo, processa em background.
-    """
+    """Webhook chamado quando phase é aprovada OU demand completa."""
     if not settings.shared_secret:
         raise HTTPException(500, "SHARED_SECRET não configurado")
     if x_shared_secret != settings.shared_secret:
@@ -194,7 +177,6 @@ async def webhook_orchestrate(
         payload.project_id, payload.trigger_source,
     )
     
-    # Fire-and-forget: cria task assíncrona e retorna imediatamente
     asyncio.create_task(_run_orchestration_safe(payload.project_id))
     
     return {
