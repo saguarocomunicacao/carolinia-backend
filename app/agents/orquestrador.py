@@ -11,16 +11,16 @@ Responsabilidades:
    - todas demands em demand.depends_on estão 'completed'
    - project.execution_status='running'
 2. Aplicar regras de paralelismo:
-   - máximo MAX_PARALLEL demandas executando simultaneamente por projeto
+   - máximo settings.max_parallel_demands_per_project demandas simultaneamente
    - demandas com expected_files comuns viram sequenciais
 3. Verificar limites de custo:
    - project.max_cost_usd_total NÃO foi atingido
 4. Despachar demanda (marcar como in_progress + criar task_run)
-5. Simular execução (P07.5.d.1 temporário) ou plugar agentes reais (P07.5.e+)
+5. Simular execução (P07.5.d temporário) ou plugar agentes reais (P07.5.e+)
 
-Pra P07.5.d.1 (esse arquivo) a execução é SIMULADA:
+Pra P07.5.d (esse arquivo) a execução é SIMULADA:
 - Marca demand 'in_progress'
-- Sleep 10s
+- Sleep settings.simulated_execution_seconds
 - Marca demand 'completed'
 - Libera dependentes
 
@@ -40,14 +40,6 @@ from app.agents.db_client import agent_db
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# Constantes
-# ============================================================
-
-MAX_PARALLEL_DEMANDS_PER_PROJECT = 3
-SIMULATED_EXECUTION_SECONDS = 10  # P07.5.d.1: simulação
 
 
 # ============================================================
@@ -85,16 +77,7 @@ class OrchestrationResult:
 # ============================================================
 
 async def _fetch_eligible_demands(project_id: str) -> list[EligibleDemand]:
-    """Busca demandas elegíveis pra execução via Edge Function get-eligible-demands.
-    
-    A Edge Function aplica os filtros:
-    - phase.status = 'approved'
-    - demand.status = 'pending'
-    - todas demands em demand.depends_on estão 'completed' OU array vazio
-    - project.execution_status = 'running'
-    
-    Retorna ordenado por (phase_order, phase_order_within_phase).
-    """
+    """Busca demandas elegíveis via Edge Function get-eligible-demands."""
     url = f"{settings.lovable_project_url}/functions/v1/get-eligible-demands"
     
     try:
@@ -162,7 +145,7 @@ async def _fetch_in_progress_demands(project_id: str) -> list[dict]:
 
 
 async def _fetch_project_cost_status(project_id: str) -> dict[str, Any]:
-    """Busca status de custo do projeto via Edge Function."""
+    """Busca status de custo do projeto."""
     url = f"{settings.lovable_project_url}/functions/v1/get-project-cost-status"
     
     try:
@@ -184,7 +167,7 @@ async def _fetch_project_cost_status(project_id: str) -> dict[str, Any]:
 
 
 async def _mark_demand_in_progress(demand_id: str) -> bool:
-    """Marca demand como in_progress via UPDATE direto (RLS bypass via service_role)."""
+    """Marca demand como in_progress."""
     url = f"{settings.lovable_project_url}/functions/v1/update-demand-status"
     
     try:
@@ -240,7 +223,7 @@ def _has_file_conflict(
     in_progress: list[dict],
 ) -> bool:
     """True se a demand tem expected_files em comum com alguma demand 
-    já em execução. Decisão #6: viram sequenciais.
+    já em execução.
     """
     if not demand.expected_files:
         return False
@@ -251,7 +234,7 @@ def _has_file_conflict(
         ip_files = set(ip.get("expected_files") or [])
         if not ip_files:
             continue
-        if demand_files & ip_files:  # intersecção
+        if demand_files & ip_files:
             return True
     
     return False
@@ -262,22 +245,17 @@ def _filter_dispatchable(
     in_progress: list[dict],
     max_parallel: int,
 ) -> tuple[list[EligibleDemand], dict[str, int]]:
-    """Filtra demands elegíveis aplicando paralelismo e file conflicts.
-    
-    Retorna: (demands_a_despachar, contadores_de_bloqueio)
-    """
+    """Filtra demands elegíveis aplicando paralelismo e file conflicts."""
     counters = {
         "blocked_by_parallelism": 0,
         "blocked_by_file_conflict": 0,
     }
     
-    # Quantas vagas livres
     available_slots = max_parallel - len(in_progress)
     if available_slots <= 0:
         counters["blocked_by_parallelism"] = len(eligible)
         return [], counters
     
-    # Simula execução: vai marcando quais "ocupariam" arquivos
     files_being_worked: set[str] = set()
     for ip in in_progress:
         files_being_worked.update(ip.get("expected_files") or [])
@@ -285,18 +263,15 @@ def _filter_dispatchable(
     to_dispatch = []
     
     for demand in eligible:
-        # Já chegou no max?
         if len(to_dispatch) >= available_slots:
             counters["blocked_by_parallelism"] += 1
             continue
         
-        # File conflict com outra já dispatched neste ciclo?
         demand_files = set(demand.expected_files or [])
         if demand_files & files_being_worked:
             counters["blocked_by_file_conflict"] += 1
             continue
         
-        # OK, despacha
         to_dispatch.append(demand)
         files_being_worked.update(demand_files)
     
@@ -304,26 +279,23 @@ def _filter_dispatchable(
 
 
 # ============================================================
-# Simulação de execução (P07.5.d.1 — temporário)
+# Simulação de execução (P07.5.d — temporário)
 # ============================================================
 
 async def _simulate_demand_execution(demand: EligibleDemand) -> None:
-    """Simula execução de uma demand: sleep + completed.
-    
-    Vai ser substituída por dispatch real ao PM em P07.5.e.
+    """Simula execução: sleep + completed. Vai ser substituída por dispatch 
+    real ao PM em P07.5.e.
     """
     logger.info(
         "[orquestrador] SIMULANDO execução demand=%s (%s) — %ds",
-        demand.id, demand.title, SIMULATED_EXECUTION_SECONDS,
+        demand.id, demand.title, settings.simulated_execution_seconds,
     )
     
-    # Marca in_progress
     success = await _mark_demand_in_progress(demand.id)
     if not success:
         logger.error("[orquestrador] Falha marcando demand=%s in_progress", demand.id)
         return
     
-    # Cria task_run inicial pra rastreabilidade
     action_id = await agent_db.create_action(
         project_id=demand.project_id,
         agent_role="orquestrador",
@@ -340,10 +312,8 @@ async def _simulate_demand_execution(demand: EligibleDemand) -> None:
             started_at=started_at,
         )
     
-    # Simula tempo de trabalho
-    await asyncio.sleep(SIMULATED_EXECUTION_SECONDS)
+    await asyncio.sleep(settings.simulated_execution_seconds)
     
-    # Marca completed
     success = await _mark_demand_completed(demand.id)
     if not success:
         logger.error("[orquestrador] Falha marcando demand=%s completed", demand.id)
@@ -361,7 +331,7 @@ async def _simulate_demand_execution(demand: EligibleDemand) -> None:
         await agent_db.update_action(
             action_id=action_id,
             status="completed",
-            output_summary=f"[SIMULAÇÃO] Demand '{demand.title}' completou em {SIMULATED_EXECUTION_SECONDS}s",
+            output_summary=f"[SIMULAÇÃO] Demand '{demand.title}' completou em {settings.simulated_execution_seconds}s",
             completed_at=completed_at,
         )
     
@@ -372,23 +342,13 @@ async def _simulate_demand_execution(demand: EligibleDemand) -> None:
 
 
 # ============================================================
-# API pública: roda uma rodada de orquestração
+# API pública
 # ============================================================
 
 async def orchestrate_project(project_id: str) -> OrchestrationResult:
-    """Executa uma rodada de orquestração pra um projeto.
-    
-    1. Busca elegíveis
-    2. Verifica limites de custo
-    3. Filtra por paralelismo + conflitos
-    4. Despacha (em paralelo, fire-and-forget — cada uma roda em própria coroutine)
-    5. Retorna métricas
-    
-    Essa função NÃO espera as demands terminarem — só dispara.
-    """
+    """Executa uma rodada de orquestração pra um projeto."""
     logger.info("[orquestrador] Iniciando rodada pra projeto=%s", project_id)
     
-    # 1. Busca elegíveis
     eligible = await _fetch_eligible_demands(project_id)
     if not eligible:
         return OrchestrationResult(
@@ -400,7 +360,6 @@ async def orchestrate_project(project_id: str) -> OrchestrationResult:
             blocked_by_cost_limit=0,
         )
     
-    # 2. Verifica limites de custo
     cost_status = await _fetch_project_cost_status(project_id)
     if cost_status.get("cost_limit_reached"):
         logger.warning(
@@ -418,14 +377,12 @@ async def orchestrate_project(project_id: str) -> OrchestrationResult:
             blocked_by_cost_limit=len(eligible),
         )
     
-    # 3. Busca em execução
     in_progress = await _fetch_in_progress_demands(project_id)
     
-    # 4. Filtra
     to_dispatch, counters = _filter_dispatchable(
         eligible=eligible,
         in_progress=in_progress,
-        max_parallel=MAX_PARALLEL_DEMANDS_PER_PROJECT,
+        max_parallel=settings.max_parallel_demands_per_project,
     )
     
     logger.info(
@@ -437,7 +394,6 @@ async def orchestrate_project(project_id: str) -> OrchestrationResult:
         counters["blocked_by_file_conflict"],
     )
     
-    # 5. Despacha (fire-and-forget — não bloqueia)
     for demand in to_dispatch:
         asyncio.create_task(_simulate_demand_execution(demand))
     
@@ -451,19 +407,8 @@ async def orchestrate_project(project_id: str) -> OrchestrationResult:
     )
 
 
-# ============================================================
-# Recovery: na inicialização, reverte demands órfãs
-# ============================================================
-
 async def recover_orphaned_demands() -> int:
-    """Chamada na inicialização do worker — reverte demands que estavam 
-    'in_progress' quando o backend parou.
-    
-    Decisão #2: in_progress → pending, pra que próxima rodada do orquestrador
-    pegue elas de novo.
-    
-    Retorna: número de demands recuperadas.
-    """
+    """Reverte demands órfãs (in_progress → pending) na inicialização."""
     url = f"{settings.lovable_project_url}/functions/v1/recover-orphaned-demands"
     
     try:
@@ -495,16 +440,8 @@ async def recover_orphaned_demands() -> int:
         return 0
 
 
-# ============================================================
-# Lista projetos ativos pra polling do worker
-# ============================================================
-
 async def list_active_projects() -> list[str]:
-    """Lista project_ids de projetos com execution_status='running' E 
-    roadmap_status IN ('approved', 'partially_approved', 'executing').
-    
-    Worker chama isso pra saber quais projetos checar a cada rodada.
-    """
+    """Lista project_ids ativos pro worker."""
     url = f"{settings.lovable_project_url}/functions/v1/list-active-projects"
     
     try:
