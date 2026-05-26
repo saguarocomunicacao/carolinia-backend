@@ -62,21 +62,16 @@ class ImageResponse:
 # ============================================================
 # Modelos que rejeitam temperature/top_p/top_k (Anthropic Opus 4.7+)
 # ============================================================
-# Ref: https://docs.anthropic.com/en/release-notes/api
-# A partir de Claude Opus 4.7, sampling params são deprecados.
 
 MODELS_REJECT_SAMPLING_PARAMS = {
     "claude-opus-4-7",
-    "claude-opus-4-7-20250101",  # variações com data
-    # Adicionar futuros Sonnet 4.7+ / Haiku 4.7+ aqui quando surgirem
+    "claude-opus-4-7-20250101",
 }
 
 
 def _model_rejects_sampling(model: str) -> bool:
-    """True se o modelo rejeita temperature/top_p/top_k."""
     if model in MODELS_REJECT_SAMPLING_PARAMS:
         return True
-    # Cobertura genérica pra variantes com data ou sufixo
     if model.startswith("claude-opus-4-7"):
         return True
     return False
@@ -95,16 +90,15 @@ PRICING = {
     # OpenAI
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    # Google (Gemini 2.5)
+    # Google
     "gemini-2.5-flash": {"input": 0.075, "output": 0.30},
     "gemini-2.5-pro": {"input": 1.25, "output": 5.0},
-    "gemini-2.5-flash-image": {"input": 0.30, "output": 30.0},  # imagem cobra alto no output
+    "gemini-2.5-flash-image": {"input": 0.30, "output": 30.0},
 }
 
-# Imagens (preço por imagem)
 IMAGE_PRICING = {
     "dall-e-3": 0.040,
-    "gemini-2.5-flash-image": 0.039,  # Nano Banana ~$0.039/imagem 1024x1024
+    "gemini-2.5-flash-image": 0.039,
 }
 
 
@@ -170,7 +164,6 @@ def _call_anthropic(
     client = _get_anthropic()
     start = time.time()
     
-    # Pra Opus 4.7+, temperature/top_p/top_k são proibidos
     kwargs = {
         "model": model,
         "max_tokens": max_tokens,
@@ -186,6 +179,15 @@ def _call_anthropic(
     text = response.content[0].text if response.content else ""
     tokens_in = response.usage.input_tokens
     tokens_out = response.usage.output_tokens
+    
+    # DETECTA TRUNCAMENTO — se modelo bateu em max_tokens, levanta
+    # exceção explícita em vez de retornar JSON truncado pro parser.
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"Modelo {model} truncou output em max_tokens={max_tokens} "
+            f"(tokens_out={tokens_out}). Aumente max_tokens ou peça output mais curto."
+        )
     
     return LLMResponse(
         text=text,
@@ -224,6 +226,14 @@ def _call_openai(
     tokens_in = response.usage.prompt_tokens
     tokens_out = response.usage.completion_tokens
     
+    # DETECTA TRUNCAMENTO no OpenAI (finish_reason='length')
+    finish_reason = response.choices[0].finish_reason if response.choices else None
+    if finish_reason == "length":
+        raise RuntimeError(
+            f"Modelo {model} truncou output em max_tokens={max_tokens} "
+            f"(tokens_out={tokens_out}). Aumente max_tokens ou peça output mais curto."
+        )
+    
     return LLMResponse(
         text=text,
         provider=Provider.OPENAI,
@@ -259,6 +269,18 @@ def _call_google(
     
     latency = int((time.time() - start) * 1000)
     text = response.text if hasattr(response, "text") else ""
+    
+    # DETECTA TRUNCAMENTO no Google (finish_reason='MAX_TOKENS')
+    try:
+        finish_reason = response.candidates[0].finish_reason
+        finish_str = str(finish_reason).upper()
+        if "MAX_TOKENS" in finish_str:
+            raise RuntimeError(
+                f"Modelo {model} truncou output em max_tokens={max_tokens}. "
+                f"Aumente max_tokens ou peça output mais curto."
+            )
+    except (AttributeError, IndexError):
+        pass  # SDK pode não expor — ignora silencioso
     
     usage = getattr(response, "usage_metadata", None)
     tokens_in = getattr(usage, "prompt_token_count", 0) if usage else 0
@@ -306,11 +328,7 @@ def _generate_image_openai(prompt: str, size: str = "1024x1024") -> ImageRespons
 
 
 def _generate_image_google(prompt: str, size: str = "1024x1024") -> ImageResponse:
-    """Gera imagem com Nano Banana (gemini-2.5-flash-image).
-    
-    Diferente do Imagen antigo, Nano Banana usa a API normal do Gemini
-    e retorna a imagem como parte inline_data nos parts da resposta.
-    """
+    """Gera imagem com Nano Banana (gemini-2.5-flash-image)."""
     genai = _get_google()
     start = time.time()
     
@@ -322,13 +340,11 @@ def _generate_image_google(prompt: str, size: str = "1024x1024") -> ImageRespons
     latency = int((time.time() - start) * 1000)
     image_b64 = None
     
-    # Procura por inline_data nos parts da resposta
     try:
         for candidate in response.candidates:
             for part in candidate.content.parts:
                 inline = getattr(part, "inline_data", None)
                 if inline and inline.data:
-                    # inline.data já vem como bytes
                     image_b64 = base64.b64encode(inline.data).decode("utf-8")
                     break
             if image_b64:
@@ -359,7 +375,7 @@ def call_llm(
 ) -> LLMResponse:
     """Chama o primeiro modelo da lista que conseguir responder.
     
-    Se um falhar (rate limit, erro de API), tenta o próximo.
+    Se um falhar (rate limit, erro de API, truncamento), tenta o próximo.
     Se TODOS falharem, levanta exceção.
     """
     last_error: Exception | None = None
@@ -367,9 +383,9 @@ def call_llm(
     for choice in model_preferences:
         try:
             logger.info(
-                "[LLMRouter] Tentando %s/%s (sys=%d chars, user=%d chars)",
+                "[LLMRouter] Tentando %s/%s (sys=%d chars, user=%d chars, max_tokens=%d)",
                 choice.provider.value, choice.model,
-                len(system_prompt), len(user_message),
+                len(system_prompt), len(user_message), max_tokens,
             )
             
             if choice.provider == Provider.ANTHROPIC:
@@ -455,9 +471,9 @@ def generate_image(
 
 # Análise textual densa (briefing, planejamento)
 PRESET_ANALISE_DENSA = [
-    ModelChoice(Provider.ANTHROPIC, settings.model_orchestrator),  # claude-opus-4-7
-    ModelChoice(Provider.OPENAI, settings.model_openai_text),       # gpt-4o
-    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),   # gemini-2.5-pro
+    ModelChoice(Provider.ANTHROPIC, settings.model_orchestrator),
+    ModelChoice(Provider.OPENAI, settings.model_openai_text),
+    ModelChoice(Provider.GOOGLE, settings.model_google_text_pro),
 ]
 
 # Decisão de orquestração (raciocínio estruturado)
@@ -468,9 +484,9 @@ PRESET_ORQUESTRACAO = [
 
 # Tarefas rápidas (Junior Dev)
 PRESET_RAPIDO = [
-    ModelChoice(Provider.ANTHROPIC, settings.model_subagent),       # claude-sonnet-4-6
-    ModelChoice(Provider.OPENAI, settings.model_openai_text_fast),  # gpt-4o-mini
-    ModelChoice(Provider.GOOGLE, settings.model_google_text),       # gemini-2.5-flash
+    ModelChoice(Provider.ANTHROPIC, settings.model_subagent),
+    ModelChoice(Provider.OPENAI, settings.model_openai_text_fast),
+    ModelChoice(Provider.GOOGLE, settings.model_google_text),
 ]
 
 # Copywriting / texto criativo
